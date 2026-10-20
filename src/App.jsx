@@ -5,7 +5,7 @@ import {
   Languages, Lightbulb, Menu, MessageCircle, Mic2, Search, Send, Sparkles,
   Volume2, X, Zap,
 } from 'lucide-react';
-import { categories, localTranslations, vocabulary } from './data/vocabulary.js';
+import { addGeneratedVocabulary, categories, loadGeneratedVocabulary, localTranslations, vocabulary } from './data/vocabulary.js';
 
 const navItems = [
   { id: 'home', label: 'Beranda', icon: Home },
@@ -25,20 +25,162 @@ const quizQuestions = [
 ];
 
 const normalizeArabic = (value = '') => value.normalize('NFD').replace(/[\u064B-\u065F\u0670]/g, '').replace(/[؟?!.,،]/g, '').trim();
+const VOCABULARY_TARGET = 2000;
+let currentAudio = null;
+let currentAudioUrl = null;
+let currentSpeechToken = 0;
 
-function speak(text, lang = 'ar-SA', notify = () => {}) {
-  if (!('speechSynthesis' in window)) {
-    notify('Browser ini belum mendukung fitur suara. Coba gunakan Chrome atau Edge terbaru.');
-    return;
+function stopCurrentAudio() {
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio.src = '';
+    currentAudio = null;
   }
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = lang;
-  utterance.rate = 0.82;
-  const voices = window.speechSynthesis.getVoices();
-  const voice = voices.find((item) => item.lang.toLowerCase().startsWith(lang.toLowerCase().split('-')[0]));
-  if (voice) utterance.voice = voice;
-  window.speechSynthesis.speak(utterance);
+  if (currentAudioUrl) {
+    URL.revokeObjectURL(currentAudioUrl);
+    currentAudioUrl = null;
+  }
+}
+
+async function speakWithAI(text, token) {
+  const endpoints = ['/api/speech', '/.netlify/functions/speech'];
+  let lastError;
+  for (const endpoint of endpoints) {
+    let response;
+    try {
+      response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+        cache: 'no-store',
+      });
+    } catch (error) {
+      lastError = error;
+      continue;
+    }
+    if ((response.status === 404 || response.status === 405) && endpoint !== endpoints[endpoints.length - 1]) continue;
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || `Layanan audio AI gagal (HTTP ${response.status}).`);
+    }
+    const blob = await response.blob();
+    if (token !== currentSpeechToken) return;
+    stopCurrentAudio();
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio();
+    audio.preload = 'auto';
+    audio.volume = 1;
+    audio.src = url;
+    currentAudioUrl = url;
+    currentAudio = audio;
+    audio.onended = () => {
+      if (currentAudio === audio) currentAudio = null;
+      if (currentAudioUrl === url) currentAudioUrl = null;
+      URL.revokeObjectURL(url);
+    };
+    audio.onerror = () => {
+      if (currentAudio === audio) currentAudio = null;
+      if (currentAudioUrl === url) currentAudioUrl = null;
+      URL.revokeObjectURL(url);
+    };
+    try {
+      await audio.play();
+      return;
+    } catch (error) {
+      stopCurrentAudio();
+      throw new Error('Browser menolak memutar audio. Coba klik tombol suara sekali lagi atau periksa pengaturan audio browser.');
+    }
+  }
+  throw new Error(lastError?.message || 'Tidak dapat menghubungi layanan audio.');
+}
+
+async function speak(text, lang = 'ar-SA', notify = () => {}) {
+  const content = String(text || '').trim();
+  if (!content) { notify('Tidak ada teks untuk dibacakan.'); return; }
+  const token = ++currentSpeechToken;
+  const languageCode = String(lang).toLowerCase().split('-')[0];
+  const synth = typeof window !== 'undefined' ? window.speechSynthesis : null;
+  const Utterance = typeof window !== 'undefined' ? window.SpeechSynthesisUtterance : null;
+  const voices = synth?.getVoices?.() || [];
+  const voice = voices.find((item) => item.lang?.toLowerCase().startsWith(languageCode));
+
+  // Utamakan suara bahasa yang sesuai jika tersedia. Pemanggilan speak dilakukan langsung
+  // dari aksi klik agar browser tidak kehilangan konteks interaksi pengguna.
+  if (synth && Utterance && voice) {
+    stopCurrentAudio();
+    synth.cancel();
+    const utterance = new Utterance(content);
+    utterance.lang = lang;
+    utterance.voice = voice;
+    utterance.rate = languageCode === 'ar' ? 0.78 : 0.9;
+    utterance.pitch = 1;
+    utterance.volume = 1;
+    let started = false;
+    let fallbackStarted = false;
+    const fallbackToAI = async (reason) => {
+      if (fallbackStarted || token !== currentSpeechToken) return;
+      fallbackStarted = true;
+      window.clearTimeout(fallbackTimer);
+      synth.cancel();
+      try {
+        await speakWithAI(content, token);
+        if (token === currentSpeechToken) notify('Memutar pelafalan AI.');
+      } catch (error) {
+        if (token === currentSpeechToken) notify(`${reason || 'Suara bawaan gagal diputar.'} Audio AI: ${error.message}`);
+      }
+    };
+    const fallbackTimer = window.setTimeout(() => {
+      if (!started) void fallbackToAI('Suara browser tidak merespons.');
+    }, 1800);
+    utterance.onstart = () => {
+      started = true;
+      window.clearTimeout(fallbackTimer);
+      if (token === currentSpeechToken) notify(`Memutar pelafalan (${voice.name || voice.lang}).`);
+    };
+    utterance.onend = () => window.clearTimeout(fallbackTimer);
+    utterance.onerror = () => {
+      window.clearTimeout(fallbackTimer);
+      void fallbackToAI('Suara browser gagal diputar.');
+    };
+    try {
+      synth.resume();
+      synth.speak(utterance);
+      return;
+    } catch {
+      window.clearTimeout(fallbackTimer);
+      // Lanjut ke layanan audio AI di bawah.
+    }
+  }
+
+  try {
+    await speakWithAI(content, token);
+    if (token === currentSpeechToken) notify('Memutar audio pelafalan AI.');
+  } catch (error) {
+    // Upaya terakhir: gunakan mesin suara bawaan meskipun tidak ditemukan suara khusus
+    // untuk bahasa Arab. Ini lebih baik daripada tombol tampak tidak melakukan apa-apa.
+    if (synth && Utterance && token === currentSpeechToken) {
+      try {
+        const utterance = new Utterance(content);
+        utterance.lang = lang;
+        utterance.rate = languageCode === 'ar' ? 0.78 : 0.9;
+        utterance.volume = 1;
+        utterance.onerror = () => notify(`Audio belum tersedia. ${error.message} Pasang suara bahasa Arab pada perangkat atau aktifkan OPENAI_API_KEY di Netlify.`);
+        synth.cancel();
+        synth.resume();
+        synth.speak(utterance);
+        notify(`Mencoba suara bawaan perangkat. Untuk pelafalan Arab yang lebih baik, aktifkan audio AI. ${error.message}`);
+        return;
+      } catch {
+        // Pesan di bawah menjelaskan cara mengaktifkan audio.
+      }
+    }
+    if (token === currentSpeechToken) notify(`Suara belum tersedia. ${error.message} Aktifkan OPENAI_API_KEY di Netlify atau pasang suara Arab pada perangkat.`);
+  }
+}
+
+function getTranslationSpeechText(result, direction) {
+  if (direction === 'ar-id') return result.match(/^Arti:\s*(.+)$/m)?.[1] || result.split('\n')[0];
+  return result.match(/^Bahasa Arab:\s*(.+)$/m)?.[1] || result.split('\n')[0];
 }
 
 function getDailyWord() {
@@ -67,11 +209,38 @@ function App() {
   const [quizChecked, setQuizChecked] = useState(false);
   const [quizDone, setQuizDone] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [vocabularyVersion, setVocabularyVersion] = useState(0);
+  const [generatingVocabulary, setGeneratingVocabulary] = useState(false);
+  const [generationProgress, setGenerationProgress] = useState(null);
+  const [vocabAdminPassword, setVocabAdminPassword] = useState('');
   const dailyWord = useMemo(getDailyWord, []);
 
   useEffect(() => {
     localStorage.setItem('arabic-smart-favorites', JSON.stringify(favorites));
   }, [favorites]);
+
+  useEffect(() => {
+    const synth = window.speechSynthesis;
+    if (!synth) return undefined;
+    synth.getVoices();
+    const warmVoices = () => synth.getVoices();
+    synth.addEventListener?.('voiceschanged', warmVoices);
+    const timer = window.setTimeout(warmVoices, 800);
+    return () => {
+      window.clearTimeout(timer);
+      synth.removeEventListener?.('voiceschanged', warmVoices);
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    loadGeneratedVocabulary().then((savedWords) => {
+      if (!active || !savedWords.length) return;
+      const loaded = addGeneratedVocabulary(savedWords, { persist: false });
+      if (loaded.length) setVocabularyVersion((version) => version + 1);
+    }).catch(() => {});
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     if (!toast) return undefined;
@@ -87,7 +256,7 @@ function App() {
       const matchesFavoritesPage = page !== 'favorites' || favorites.includes(item.id);
       return matchesCategory && matchesSearch && matchesFavoritesPage;
     });
-  }, [activeCategory, favorites, page, search]);
+  }, [activeCategory, favorites, page, search, vocabularyVersion]);
 
   function toggleFavorite(id) {
     setFavorites((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
@@ -151,6 +320,83 @@ function App() {
       else setTranslationResult(`Belum dapat menerjemahkan dengan AI.\n\n${error.message}\n\nAnda tetap dapat mencari kata yang tersedia di menu Kamus Bergambar. Untuk mengaktifkan terjemahan AI, tambahkan OPENAI_API_KEY di pengaturan environment Netlify dan deploy ulang.`);
     } finally {
       setTranslationLoading(false);
+    }
+  }
+
+  function exportGeneratedVocabulary() {
+    const generated = vocabulary.filter((item) => typeof item.id === 'string' && item.id.startsWith('ai-'));
+    if (!generated.length) {
+      setToast('Belum ada kosakata AI yang bisa diekspor.');
+      return;
+    }
+    const blob = new Blob([JSON.stringify(generated.map(({ id, ...item }) => item), null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'kamus-arab-generated.json';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setToast(`${generated.length.toLocaleString('id-ID')} kosakata AI diekspor ke JSON.`);
+  }
+
+  async function handleGenerateVocabulary(fillToTarget = false) {
+    if (activeCategory === 'semua') {
+      setToast('Pilih satu materi terlebih dahulu agar kosakata sesuai topik.');
+      return;
+    }
+    const topic = categories.find((item) => item.id === activeCategory);
+    if (!topic) return;
+    const initialCount = vocabulary.filter((item) => item.category === activeCategory).length;
+    if (initialCount >= VOCABULARY_TARGET) {
+      setToast(`Materi ${topic.label} sudah mencapai target ${VOCABULARY_TARGET.toLocaleString('id-ID')} kosakata.`);
+      return;
+    }
+    if (fillToTarget && !window.confirm(`AI akan menyusun kosakata untuk materi ${topic.label} sampai ${VOCABULARY_TARGET.toLocaleString('id-ID')} kata. Proses ini dapat memerlukan sekitar 20–30 permintaan AI dan menggunakan kuota API. Lanjutkan?`)) return;
+
+    setGeneratingVocabulary(true);
+    let batches = 0;
+    let totalAdded = 0;
+    let lastError = '';
+    try {
+      const maxBatches = fillToTarget ? 30 : 1;
+      while (batches < maxBatches) {
+        const currentCount = vocabulary.filter((item) => item.category === activeCategory).length;
+        if (currentCount >= VOCABULARY_TARGET) break;
+        const existingWords = vocabulary
+          .filter((item) => item.category === activeCategory)
+          .slice(-400)
+          .map(({ arabic, indo }) => ({ arabic, indo }));
+        const response = await fetch('/api/vocabulary', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ category: activeCategory, existingWords, count: Math.min(100, VOCABULARY_TARGET - currentCount), adminPassword: vocabAdminPassword }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || 'Gagal menambah kosakata.');
+        const added = addGeneratedVocabulary((data.words || []).map((item) => ({ ...item, category: activeCategory })));
+        batches += 1;
+        totalAdded += added.length;
+        setVocabularyVersion((version) => version + 1);
+        const updatedCount = vocabulary.filter((item) => item.category === activeCategory).length;
+        setGenerationProgress({ category: activeCategory, count: updatedCount, target: VOCABULARY_TARGET, batches });
+        if (!added.length) {
+          lastError = 'Batch AI ini hanya menghasilkan kata yang sudah ada. Proses dihentikan agar tidak mengulang permintaan tanpa hasil.';
+          break;
+        }
+        if (!fillToTarget) break;
+      }
+      const finalCount = vocabulary.filter((item) => item.category === activeCategory).length;
+      if (finalCount >= VOCABULARY_TARGET) setToast(`Berhasil! Materi ${topic.label} mencapai ${finalCount.toLocaleString('id-ID')} kosakata di browser ini.`);
+      else if (totalAdded > 0 && fillToTarget) setToast(`${totalAdded.toLocaleString('id-ID')} kosakata baru ditambahkan. Sekarang ${finalCount.toLocaleString('id-ID')}/${VOCABULARY_TARGET.toLocaleString('id-ID')} kata${lastError ? `. ${lastError}` : '. Anda dapat melanjutkan proses nanti.'}`);
+      else if (totalAdded > 0) setToast(`${totalAdded} kosakata baru untuk materi ${topic.label} berhasil ditambahkan dan disimpan di browser ini.`);
+      else setToast(lastError || 'Batch ini tidak menambah kata baru karena hasilnya duplikat. Coba lagi.');
+    } catch (error) {
+      setToast(`${error.message} Pastikan OPENAI_API_KEY dan VOCAB_ADMIN_PASSWORD sudah diatur di Netlify.`);
+    } finally {
+      setGeneratingVocabulary(false);
+      setGenerationProgress(null);
     }
   }
 
@@ -237,7 +483,7 @@ function App() {
 
         <main className="page-content">
           {page === 'home' && <HomePage dailyWord={dailyWord} selectPage={selectPage} setActiveCategory={setActiveCategory} speak={speak} setToast={setToast} favorites={favorites} toggleFavorite={toggleFavorite} />}
-          {(page === 'dictionary' || page === 'favorites') && <DictionaryPage page={page} search={search} setSearch={setSearch} activeCategory={activeCategory} setActiveCategory={setActiveCategory} filteredVocabulary={filteredVocabulary} favorites={favorites} toggleFavorite={toggleFavorite} speak={speak} setToast={setToast} />}
+          {(page === 'dictionary' || page === 'favorites') && <DictionaryPage page={page} search={search} setSearch={setSearch} activeCategory={activeCategory} setActiveCategory={setActiveCategory} filteredVocabulary={filteredVocabulary} favorites={favorites} toggleFavorite={toggleFavorite} speak={speak} setToast={setToast} generatingVocabulary={generatingVocabulary} onGenerateVocabulary={handleGenerateVocabulary} generationProgress={generationProgress} vocabAdminPassword={vocabAdminPassword} setVocabAdminPassword={setVocabAdminPassword} generatedVocabularyCount={vocabulary.filter((item) => typeof item.id === 'string' && item.id.startsWith('ai-')).length} onExportVocabulary={exportGeneratedVocabulary} />}
           {page === 'translator' && <TranslatorPage direction={direction} setDirection={setDirection} translationText={translationText} setTranslationText={setTranslationText} translationResult={translationResult} setTranslationResult={setTranslationResult} translationLoading={translationLoading} handleTranslate={handleTranslate} speak={speak} copyText={copyText} setToast={setToast} />}
           {page === 'daily' && <DailyPage dailyWord={dailyWord} speak={speak} setToast={setToast} selectPage={selectPage} />}
           {page === 'tutor' && <TutorPage aiQuestion={aiQuestion} setAiQuestion={setAiQuestion} aiAnswer={aiAnswer} aiLoading={aiLoading} handleTutor={handleTutor} setAiQuestionText={(value) => setAiQuestion(value)} />}
@@ -260,23 +506,33 @@ function HomePage({ dailyWord, selectPage, setActiveCategory, speak, setToast, f
       <div className="hero-bottom-note"><span className="mini-avatar-stack"><i>ع</i><i>ب</i><i>م</i></span><span>Mulai dari kata sederhana, tumbuh setiap hari.</span></div>
     </section>
     <section className="stat-grid">
-      <div className="stat-card"><span className="stat-icon stat-teal"><BookOpen size={19} /></span><div><strong>36+</strong><span>Kosakata awal</span></div><span className="stat-note">Terus bertambah</span></div>
+      <div className="stat-card"><span className="stat-icon stat-teal"><BookOpen size={19} /></span><div><strong>{vocabulary.length.toLocaleString('id-ID')}</strong><span>Kosakata tersedia</span></div><span className="stat-note">Terus bertambah</span></div>
       <div className="stat-card"><span className="stat-icon stat-orange"><Headphones size={19} /></span><div><strong>Audio</strong><span>Pelafalan kata</span></div><span className="stat-note">Klik untuk dengar</span></div>
       <div className="stat-card"><span className="stat-icon stat-purple"><Sparkles size={19} /></span><div><strong>AI</strong><span>Penerjemah pintar</span></div><span className="stat-note">Perlu API key</span></div>
       <div className="stat-card"><span className="stat-icon stat-blue"><Heart size={19} /></span><div><strong>{favorites.length}</strong><span>Kata tersimpan</span></div><span className="stat-note">Koleksi pribadi</span></div>
     </section>
-    <section className="section-block"><div className="section-heading"><div><p className="eyebrow">MULAI DARI SINI</p><h2>Jelajahi berdasarkan tema</h2><p className="muted">Pilih topik yang paling dekat dengan keseharianmu.</p></div><button className="text-link" onClick={() => selectPage('dictionary')}>Lihat semua <ArrowRight size={15} /></button></div><div className="topic-grid">{categories.filter((item) => item.id !== 'semua').slice(0, 6).map((item, index) => <button className={`topic-card topic-${index + 1}`} key={item.id} onClick={() => { setActiveCategory(item.id); selectPage('dictionary'); }}><span className="topic-emoji">{item.icon}</span><span className="topic-label">{item.label}</span><span className="topic-count">{vocabulary.filter((word) => word.category === item.id).length} kata</span><ArrowRight className="topic-arrow" size={16} /></button>)}</div></section>
+    <section className="section-block"><div className="section-heading"><div><p className="eyebrow">MULAI DARI SINI</p><h2>Jelajahi berdasarkan tema</h2><p className="muted">Pilih topik yang paling dekat dengan keseharianmu.</p></div><button className="text-link" onClick={() => selectPage('dictionary')}>Lihat semua <ArrowRight size={15} /></button></div><div className="topic-grid">{categories.filter((item) => item.id !== 'semua').slice(0, 6).map((item, index) => <button className={`topic-card topic-${index + 1}`} key={item.id} onClick={() => { selectPage('dictionary'); setActiveCategory(item.id); }}><span className="topic-emoji">{item.icon}</span><span className="topic-label">{item.label}</span><span className="topic-count">{vocabulary.filter((word) => word.category === item.id).length} kata</span><ArrowRight className="topic-arrow" size={16} /></button>)}</div></section>
     <section className="section-block"><div className="section-heading"><div><p className="eyebrow">KOSAKATA PILIHAN</p><h2>Kata untuk hari ini</h2><p className="muted">Kenali kata, dengarkan bunyinya, lalu coba gunakan dalam kalimat.</p></div><button className="text-link" onClick={() => selectPage('daily')}>Kosakata harian <ArrowRight size={15} /></button></div><div className="vocab-grid vocab-grid-featured">{featured.map((item) => <VocabCard key={item.id} item={item} speak={speak} favorites={favorites} toggleFavorite={toggleFavorite} setToast={setToast} />)}</div></section>
     <section className="daily-strip"><div className="daily-strip-icon">☀️</div><div><span className="eyebrow">KOSAKATA HARI INI</span><h3>{dailyWord.arabic} <span>— {dailyWord.indo}</span></h3><p>{dailyWord.latin.trim()} · {dailyWord.exampleId}</p></div><button className="button button-outline" onClick={() => selectPage('daily')}>Belajar kata ini <ArrowRight size={15} /></button><button className="sound-circle" onClick={() => speak(dailyWord.arabic, 'ar-SA', setToast)} aria-label="Dengarkan kosakata hari ini"><Volume2 size={19} /></button></section>
   </div>;
 }
 
-function DictionaryPage({ page, search, setSearch, activeCategory, setActiveCategory, filteredVocabulary, favorites, toggleFavorite, speak, setToast }) {
+function DictionaryPage({ page, search, setSearch, activeCategory, setActiveCategory, filteredVocabulary, favorites, toggleFavorite, speak, setToast, generatingVocabulary, onGenerateVocabulary, generationProgress, vocabAdminPassword, setVocabAdminPassword, generatedVocabularyCount, onExportVocabulary }) {
+  const [visibleCount, setVisibleCount] = useState(60);
+  useEffect(() => setVisibleCount(60), [activeCategory, search, page]);
+  const displayedVocabulary = filteredVocabulary.slice(0, visibleCount);
+  const activeTopic = categories.find((item) => item.id === activeCategory);
+  const topicCount = activeCategory === 'semua' ? 0 : vocabulary.filter((item) => item.category === activeCategory).length;
+  const progress = Math.min(100, Math.round((topicCount / VOCABULARY_TARGET) * 100));
   return <div className="page-stack">
-    <section className="page-title-row"><div><p className="eyebrow">TEMUKAN KATA YANG TEPAT</p><h1>{page === 'favorites' ? 'Kata tersimpan' : 'Kamus bergambar'}</h1><p className="muted">{page === 'favorites' ? 'Kumpulan kosakata yang Anda tandai untuk dipelajari kembali.' : 'Lihat gambar, baca tulisan Arab, lalu dengarkan cara pengucapannya.'}</p></div><span className="title-count"><BookOpen size={17} /> {filteredVocabulary.length} kata</span></section>
+    <section className="page-title-row"><div><p className="eyebrow">TEMUKAN KATA YANG TEPAT</p><h1>{page === 'favorites' ? 'Kata tersimpan' : 'Kamus bergambar'}</h1><p className="muted">{page === 'favorites' ? 'Kumpulan kosakata yang Anda tandai untuk dipelajari kembali.' : 'Lihat gambar, baca tulisan Arab, lalu dengarkan cara pengucapannya.'}</p></div><div className="dictionary-title-actions"><button className="button button-outline sound-test-button" onClick={() => speak('مَرْحَبًا، أَهْلًا وَسَهْلًا', 'ar-SA', setToast)}><Volume2 size={15} /> Tes suara Arab</button><span className="title-count"><BookOpen size={17} /> {filteredVocabulary.length.toLocaleString('id-ID')} kata</span></div></section>
     <div className="dictionary-toolbar"><label className="dictionary-search"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Cari dalam bahasa Arab atau Indonesia..." /><kbd>/</kbd></label><button className="filter-button" onClick={() => setActiveCategory('semua')}><Compass size={17} /> Semua tema <ChevronDown size={15} /></button></div>
     <div className="category-chips">{categories.map((category) => <button key={category.id} onClick={() => setActiveCategory(category.id)} className={`category-chip ${activeCategory === category.id ? 'selected' : ''}`}><span>{category.icon}</span>{category.label}</button>)}</div>
-    {filteredVocabulary.length ? <div className="vocab-grid">{filteredVocabulary.map((item) => <VocabCard key={item.id} item={item} speak={speak} favorites={favorites} toggleFavorite={toggleFavorite} setToast={setToast} />)}</div> : <div className="empty-state"><span>🔎</span><h3>Kosakata belum ditemukan</h3><p>Coba kata lain atau pilih kategori “Semua kata”.</p><button className="button button-primary" onClick={() => { setSearch(''); setActiveCategory('semua'); }}>Tampilkan semua kata</button></div>}
+    {page === 'dictionary' && <section className="vocab-expansion-card">
+      <div className="vocab-expansion-copy"><p className="eyebrow">KAMUS TERUS BERTUMBUH</p><h3>{activeCategory === 'semua' ? 'Pilih materi untuk menambah kosakata' : `Materi ${activeTopic?.label || ''}`}</h3><p>{activeCategory === 'semua' ? 'Pilih salah satu kategori di atas. AI dapat menyusun kosakata baru secara bertahap.' : `${topicCount.toLocaleString('id-ID')} dari ${VOCABULARY_TARGET.toLocaleString('id-ID')} kosakata pada target materi ini.`}</p>{activeCategory !== 'semua' && <div className="vocab-progress"><span style={{ width: `${progress}%` }} /></div>}</div>
+      <div className="vocab-expansion-actions">{activeCategory !== 'semua' && <><input className="vocab-admin-password" type="password" value={vocabAdminPassword} onChange={(event) => setVocabAdminPassword(event.target.value)} placeholder="Password admin kosakata" aria-label="Password admin kosakata" autoComplete="current-password" /><button className="button button-primary" onClick={() => onGenerateVocabulary(false)} disabled={generatingVocabulary || topicCount >= VOCABULARY_TARGET || !vocabAdminPassword.trim()}>{generatingVocabulary ? <><span className="button-spinner" /> Menyusun…</> : topicCount >= VOCABULARY_TARGET ? 'Target tercapai' : <><Sparkles size={15} /> Tambah 100 kata AI</>}</button><button className="button button-outline" onClick={() => onGenerateVocabulary(true)} disabled={generatingVocabulary || topicCount >= VOCABULARY_TARGET || !vocabAdminPassword.trim()}>{generatingVocabulary ? <><span className="button-spinner" /> {generationProgress ? `${generationProgress.count.toLocaleString('id-ID')}/${generationProgress.target.toLocaleString('id-ID')} kata` : 'Memproses…'}</> : <><Zap size={15} /> Isi sampai 2.000 kata</>}</button></>}<small>Perlu OPENAI_API_KEY dan VOCAB_ADMIN_PASSWORD di Netlify. Kosakata AI disimpan di browser admin ini terlebih dahulu; ekspor dan impor ke proyek untuk menerbitkannya kepada semua pengunjung.</small>{generatedVocabularyCount > 0 && <button className="button button-outline vocab-export-button" onClick={onExportVocabulary}>Unduh {generatedVocabularyCount.toLocaleString('id-ID')} kata AI (.json)</button>}</div>
+    </section>}
+    {filteredVocabulary.length ? <><div className="vocab-grid">{displayedVocabulary.map((item) => <VocabCard key={item.id} item={item} speak={speak} favorites={favorites} toggleFavorite={toggleFavorite} setToast={setToast} />)}</div>{filteredVocabulary.length > displayedVocabulary.length && <div className="load-more-row"><span>Menampilkan {displayedVocabulary.length.toLocaleString('id-ID')} dari {filteredVocabulary.length.toLocaleString('id-ID')} kata</span><button className="button button-outline" onClick={() => setVisibleCount((count) => count + 60)}>Muat 60 kata berikutnya <ArrowRight size={15} /></button></div>}</> : <div className="empty-state"><span>🔎</span><h3>Kosakata belum ditemukan</h3><p>Coba kata lain atau pilih kategori “Semua kata”.</p><button className="button button-primary" onClick={() => { setSearch(''); setActiveCategory('semua'); }}>Tampilkan semua kata</button></div>}
     <div className="dictionary-tip"><Lightbulb size={19} /><p><strong>Tips belajar:</strong> Dengarkan pelafalan sambil membaca tulisan Arab. Ulangi 2–3 kali, lalu gunakan kata tersebut dalam kalimat sederhana.</p></div>
   </div>;
 }
@@ -285,7 +541,7 @@ function VocabCard({ item, speak, favorites, toggleFavorite, setToast }) {
   const saved = favorites.includes(item.id);
   return <article className="vocab-card">
     <div className="vocab-image-wrap"><div className="vocab-image-fallback">{item.emoji}</div>{item.image && <img className="vocab-image" src={item.image} alt={item.indo} loading="lazy" onError={(event) => { event.currentTarget.style.display = 'none'; }} />}<span className="vocab-category-tag">{categories.find((category) => category.id === item.category)?.label || 'Kosakata'}</span><button className={`favorite-button ${saved ? 'is-saved' : ''}`} onClick={() => toggleFavorite(item.id)} aria-label={saved ? 'Hapus dari tersimpan' : 'Simpan kosakata'}><Heart size={17} fill={saved ? 'currentColor' : 'none'} /></button></div>
-    <div className="vocab-card-body"><div className="vocab-arabic-row"><div><h3 className="arabic-text" dir="rtl" lang="ar">{item.arabic}</h3><p className="vocab-latin">{item.latin.trim()}</p></div><button className="sound-button" onClick={() => speak(item.arabic, 'ar-SA', setToast)} aria-label={`Dengarkan ${item.arabic}`}><Volume2 size={18} /></button></div><p className="vocab-meaning">{item.indo}</p><div className="vocab-example"><p className="example-arabic" dir="rtl" lang="ar">{item.exampleAr}</p><p>{item.exampleId}</p></div></div>
+    <div className="vocab-card-body"><div className="vocab-arabic-row"><div><h3 className="arabic-text" dir="rtl" lang="ar">{item.arabic}</h3><p className="vocab-latin">{item.latin.trim()}</p></div><button className="sound-button" onClick={() => speak(item.arabic, 'ar-SA', setToast)} aria-label={`Dengarkan ${item.arabic}`}><Volume2 size={18} /></button></div><p className="vocab-meaning">{item.indo}</p>{(item.exampleAr || item.exampleId) && <div className="vocab-example">{item.exampleAr && <p className="example-arabic" dir="rtl" lang="ar">{item.exampleAr}</p>}{item.exampleId && <p>{item.exampleId}</p>}</div>}</div>
   </article>;
 }
 
@@ -297,7 +553,7 @@ function TranslatorPage({ direction, setDirection, translationText, setTranslati
     <form className="translator-grid" onSubmit={handleTranslate}>
       <section className="translation-panel"><div className="translation-panel-head"><span>{isArabicToIndonesian ? 'Bahasa Arab' : 'Bahasa Indonesia'}</span><span className="language-code">{isArabicToIndonesian ? 'AR' : 'ID'}</span></div><textarea value={translationText} onChange={(event) => setTranslationText(event.target.value)} placeholder={isArabicToIndonesian ? 'اكتب كلمة أو جملة هنا…\n\nKetik kata atau kalimat Arab di sini' : 'Ketik kata atau kalimat dalam bahasa Indonesia di sini…'} dir={isArabicToIndonesian ? 'auto' : 'ltr'} maxLength={1800} /><div className="translation-panel-foot"><span>{translationText.length}/1.800 karakter</span><button type="button" className="small-icon-button" onClick={() => { setTranslationText(''); setTranslationResult(''); }} title="Hapus teks"><X size={16} /></button></div></section>
       <div className="direction-switch-wrap"><button type="button" className="direction-switch" onClick={() => { setDirection(isArabicToIndonesian ? 'id-ar' : 'ar-id'); setTranslationResult(''); }} aria-label="Tukar arah terjemahan"><ArrowDownUp size={19} /></button></div>
-      <section className="translation-panel result-panel"><div className="translation-panel-head"><span>{isArabicToIndonesian ? 'Bahasa Indonesia' : 'Bahasa Arab'}</span><span className="language-code">{isArabicToIndonesian ? 'ID' : 'AR'}</span></div><div className={`translation-output ${translationResult ? 'has-result' : ''}`} aria-live="polite">{translationLoading ? <div className="loading-state"><span className="spinner" /><span>Sedang menerjemahkan…</span></div> : translationResult ? <p>{translationResult}</p> : <div className="result-placeholder"><span className="result-placeholder-icon"><Languages size={23} /></span><strong>Hasil terjemahan akan muncul di sini</strong><span>Masukkan teks, lalu tekan tombol terjemahkan.</span></div>}</div><div className="translation-panel-foot"><span>{translationResult ? 'Periksa konteks sebelum digunakan' : 'Menunggu teks'}</span>{translationResult && <div className="result-actions"><button type="button" className="small-icon-button" onClick={() => copyText(translationResult)} title="Salin hasil"><Copy size={16} /></button><button type="button" className="small-icon-button" onClick={() => speak(translationResult.split('\n')[0], isArabicToIndonesian ? 'id-ID' : 'ar-SA', setToast)} title="Dengarkan hasil"><Volume2 size={16} /></button></div>}</div></section>
+      <section className="translation-panel result-panel"><div className="translation-panel-head"><span>{isArabicToIndonesian ? 'Bahasa Indonesia' : 'Bahasa Arab'}</span><span className="language-code">{isArabicToIndonesian ? 'ID' : 'AR'}</span></div><div className={`translation-output ${translationResult ? 'has-result' : ''}`} aria-live="polite">{translationLoading ? <div className="loading-state"><span className="spinner" /><span>Sedang menerjemahkan…</span></div> : translationResult ? <p>{translationResult}</p> : <div className="result-placeholder"><span className="result-placeholder-icon"><Languages size={23} /></span><strong>Hasil terjemahan akan muncul di sini</strong><span>Masukkan teks, lalu tekan tombol terjemahkan.</span></div>}</div><div className="translation-panel-foot"><span>{translationResult ? 'Periksa konteks sebelum digunakan' : 'Menunggu teks'}</span>{translationResult && <div className="result-actions"><button type="button" className="small-icon-button" onClick={() => copyText(translationResult)} title="Salin hasil"><Copy size={16} /></button><button type="button" className="small-icon-button" onClick={() => speak(getTranslationSpeechText(translationResult, direction), isArabicToIndonesian ? 'id-ID' : 'ar-SA', setToast)} title="Dengarkan hasil"><Volume2 size={16} /></button></div>}</div></section>
       <div className="translate-submit-row"><span><Sparkles size={15} /> Terjemahan AI memerlukan API key aktif.</span><button className="button button-primary translate-submit" type="submit" disabled={translationLoading}>{translationLoading ? <><span className="button-spinner" /> Memproses…</> : <>Terjemahkan <ArrowRight size={16} /></>}</button></div>
     </form>
     <section className="section-block translator-examples"><div className="section-heading"><div><p className="eyebrow">COBA KALIMAT INI</p><h2>Mulai dengan contoh</h2></div></div><div className="example-prompt-grid">{['السلام عليكم', 'Apa kabar?', 'Saya ingin belajar bahasa Arab', 'Terima kasih banyak'].map((example) => <button key={example} onClick={() => { setTranslationText(example); setDirection(/[\u0600-\u06FF]/.test(example) ? 'ar-id' : 'id-ar'); setTranslationResult(''); }}><span>{example}</span><ArrowRight size={15} /></button>)}</div></section>

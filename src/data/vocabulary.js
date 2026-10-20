@@ -1,3 +1,7 @@
+import { extraVocabulary } from './vocabulary-extra.js';
+import { importedVocabulary } from './vocabulary-imported.js';
+import { expandedVocabulary } from './vocabulary-expanded.js';
+
 export const categories = [
   { id: 'semua', label: 'Semua kata', icon: '🌟' },
   { id: 'rumah', label: 'Rumah', icon: '🏡' },
@@ -7,9 +11,17 @@ export const categories = [
   { id: 'perjalanan', label: 'Perjalanan', icon: '🚌' },
   { id: 'keseharian', label: 'Keseharian', icon: '💬' },
   { id: 'ibadah', label: 'Ibadah', icon: '🕌' },
+  { id: 'tubuh', label: 'Anggota tubuh', icon: '🧍' },
+  { id: 'kesehatan', label: 'Kesehatan', icon: '🩺' },
+  { id: 'pekerjaan', label: 'Pekerjaan', icon: '💼' },
+  { id: 'teknologi', label: 'Teknologi', icon: '💻' },
+  { id: 'alam', label: 'Alam', icon: '🌿' },
+  { id: 'warna-angka', label: 'Warna & angka', icon: '🎨' },
+  { id: 'kata-kerja', label: 'Kata kerja', icon: '🏃' },
+  { id: 'sifat', label: 'Kata sifat', icon: '✨' },
 ];
 
-export const vocabulary = [
+const baseVocabulary = [
   { id: 1, arabic: 'بَيْتٌ', latin: 'baytun', indo: 'rumah', category: 'rumah', emoji: '🏡', image: 'https://images.unsplash.com/photo-1570129477492-45c003edd2be?auto=format&fit=crop&w=600&q=80', exampleAr: 'هٰذَا بَيْتِيْ', exampleId: 'Ini rumah saya.' },
   { id: 2, arabic: 'بَابٌ', latin: 'bābun', indo: 'pintu', category: 'rumah', emoji: '🚪', exampleAr: 'اِفْتَحِ الْبَابَ', exampleId: 'Bukalah pintu.' },
   { id: 3, arabic: 'نَافِذَةٌ', latin: 'nāfidhatun', indo: 'jendela', category: 'rumah', emoji: '🪟', exampleAr: 'النَّافِذَةُ مَفْتُوْحَةٌ', exampleId: 'Jendelanya terbuka.' },
@@ -47,6 +59,120 @@ export const vocabulary = [
   { id: 35, arabic: 'تَفَضَّلْ', latin: 'tafaḍḍal', indo: 'silakan (kepada laki-laki)', category: 'keseharian', emoji: '🤝', exampleAr: 'تَفَضَّلْ، اِجْلِسْ هُنَا', exampleId: 'Silakan, duduklah di sini.' },
   { id: 36, arabic: 'أُحِبُّكَ', latin: 'uḥibbuka', indo: 'saya menyayangimu (laki-laki)', category: 'keseharian', emoji: '❤️', exampleAr: 'أُحِبُّكَ فِي اللَّهِ', exampleId: 'Saya menyayangimu karena Allah.' },
 ];
+
+
+const normalizeWord = (value = '') => String(value).normalize('NFD').replace(/[\u064B-\u065F\u0670\u0640]/g, '').trim().toLocaleLowerCase('id-ID');
+
+const readSavedVocabulary = () => {
+  if (typeof window === 'undefined') return [];
+  try {
+    const value = JSON.parse(window.localStorage.getItem('arabic-smart-generated-vocabulary') || '[]');
+    return Array.isArray(value) ? value : [];
+  } catch {
+    return [];
+  }
+};
+
+const storedGeneratedVocabulary = readSavedVocabulary();
+const allVocabulary = [
+  ...baseVocabulary,
+  ...extraVocabulary.map((item, index) => ({ id: baseVocabulary.length + index + 1, ...item })),
+  ...expandedVocabulary.map((item, index) => ({ id: baseVocabulary.length + extraVocabulary.length + index + 1, ...item })),
+  ...importedVocabulary.map((item, index) => ({ id: `imported-${index + 1}`, ...item })),
+  ...storedGeneratedVocabulary,
+];
+const seenArabicWords = new Set();
+export const vocabulary = allVocabulary.filter((item) => {
+  const key = normalizeWord(item.arabic);
+  if (!key || seenArabicWords.has(key)) return false;
+  seenArabicWords.add(key);
+  return true;
+});
+const VOCAB_DB_NAME = 'arabic-smart-vocabulary';
+const VOCAB_STORE_NAME = 'generated-words';
+
+function openVocabularyDb() {
+  return new Promise((resolve, reject) => {
+    if (typeof window === 'undefined' || !window.indexedDB) {
+      reject(new Error('IndexedDB tidak tersedia.'));
+      return;
+    }
+    const request = window.indexedDB.open(VOCAB_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(VOCAB_STORE_NAME)) db.createObjectStore(VOCAB_STORE_NAME, { keyPath: 'id' });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('Tidak dapat membuka penyimpanan kosakata.'));
+  });
+}
+
+async function persistGeneratedVocabulary(items) {
+  if (typeof window === 'undefined') return;
+  try {
+    const db = await openVocabularyDb();
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(VOCAB_STORE_NAME, 'readwrite');
+      const store = transaction.objectStore(VOCAB_STORE_NAME);
+      items.forEach((item) => store.put(item));
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error('Penyimpanan gagal.'));
+      transaction.onabort = () => reject(transaction.error || new Error('Penyimpanan dibatalkan.'));
+    });
+    db.close();
+  } catch {
+    try {
+      const previous = readSavedVocabulary();
+      const next = [...previous, ...items];
+      window.localStorage.setItem('arabic-smart-generated-vocabulary', JSON.stringify(next));
+    } catch {
+      // The UI remains usable for the current session; export the batch before closing the tab.
+    }
+  }
+}
+
+export async function loadGeneratedVocabulary() {
+  if (typeof window === 'undefined') return [];
+  try {
+    const db = await openVocabularyDb();
+    const items = await new Promise((resolve, reject) => {
+      const request = db.transaction(VOCAB_STORE_NAME, 'readonly').objectStore(VOCAB_STORE_NAME).getAll();
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => reject(request.error || new Error('Tidak dapat membaca kosakata.'));
+    });
+    db.close();
+    if (items.length) return items;
+  } catch {
+    // Use the legacy localStorage fallback below.
+  }
+  return readSavedVocabulary();
+}
+
+export function addGeneratedVocabulary(items, options = {}) {
+  const knownArabic = new Set(vocabulary.map((item) => normalizeWord(item.arabic)));
+  const unique = [];
+  for (const item of items || []) {
+    const arabicKey = normalizeWord(item.arabic);
+    const indoKey = normalizeWord(item.indo);
+    if (!arabicKey || !indoKey || knownArabic.has(arabicKey)) continue;
+    const entry = {
+      id: typeof item.id === 'string' && item.id.startsWith('ai-') ? item.id : `ai-${Date.now()}-${unique.length}-${Math.random().toString(36).slice(2, 7)}`,
+      category: item.category,
+      arabic: String(item.arabic).trim(),
+      latin: String(item.latin || '').trim(),
+      indo: String(item.indo).trim(),
+      emoji: String(item.emoji || '📘'),
+      exampleAr: String(item.exampleAr || ''),
+      exampleId: String(item.exampleId || ''),
+    };
+    unique.push(entry);
+    knownArabic.add(arabicKey);
+  }
+  if (!unique.length) return [];
+  vocabulary.push(...unique);
+  if (options.persist !== false) void persistGeneratedVocabulary(unique);
+  return unique;
+}
 
 export const localTranslations = {
   'halo': 'مَرْحَبًا',
